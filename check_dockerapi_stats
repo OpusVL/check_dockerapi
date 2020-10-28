@@ -14,7 +14,7 @@ STATE_UNKNOWN=3
 
 # Plugin variable description
 PROGNAME=$(basename $0)
-RELEASE="Revision 1.0.0"
+RELEASE="Revision 1.0.1"
 AUTHOR="(c) 2020 Paul Bargewell (paul.bargewell@opusvl.com)"
 
 if [ ! -x $JQ ]; then
@@ -155,6 +155,11 @@ ID=$(eval "${CURL} --silent ${PROTOCOL}${HOST}:${PORT}/containers/json?all=true 
 
 # Make a one time (not streaming) call to stats
 JSON=`${CURL} --silent ${PROTOCOL}${HOST}:${PORT}/containers/${ID}/stats?stream=false $TLS_OPTIONS`
+
+if [ -z "$JSON" ]; then
+  echo "UNKNOWN: Unable to collect container data from the docker API"
+  exit $STATE_UNKNOWN
+fi
 
 NAGIOS_DATA=
 
