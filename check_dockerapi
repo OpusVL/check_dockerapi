@@ -1,0 +1,186 @@
+#!/bin/bash
+
+JQ=`which jq`
+CURL=`which curl`
+
+# Nagios return codes
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# Plugin variable description
+PROGNAME=$(basename $0)
+RELEASE="Revision 1.0.0"
+AUTHOR="(c) 2020 Paul Bargewell (paul.bargewell@opusvl.com)"
+
+if [ ! -x $JQ ]; then
+  echo "UNKNOWN: jq not found or is not executable"
+  exit $STATE_UNKNOWN
+fi
+
+if [ ! -x $CURL ]; then
+  echo "UNKNOWN: curl not found or is not executable"
+  exit $STATE_UNKNOWN
+fi
+
+# Functions plugin usage
+print_release() {
+    echo "$RELEASE $AUTHOR"
+}
+
+print_usage() {
+    echo ""
+    echo "$PROGNAME $RELEASE - Checks Docker Container Status from Docker API for Icinga2"
+    echo ""
+    echo "Usage: $PROGNAME"
+    echo ""
+    echo "  -h           Show this page"
+    echo ""
+    echo "  -H | --host  Host name / IP of Docker API server (required)"
+    echo ""
+    echo "  -P | --port  Port Number of Docker API Service"
+    echo ""
+    echo "  --https      Use HTTPS requires cert, key and cacert set"
+    echo ""
+    echo "    --cert       Client certificate (pem)"
+    echo ""
+    echo "    --key        Client key (pem)"
+    echo ""
+    echo "    --cacert     CA cert (pem)"
+    echo ""
+    echo "  --include    String of container names to include"
+    echo ""
+    echo "  --exclude    String of container names to exclude"
+    echo ""
+    echo "Usage: $PROGNAME --help"
+    echo ""
+    exit 0
+}
+
+print_help() {
+	print_usage
+  echo ""
+  echo "This plugin will check Docker container statuses using the Docker API"
+  echo ""
+	exit 0
+}
+
+# Defaults
+PROTOCOL=http://
+PORT=2376
+EXCLUDE=
+INCLUDE=
+
+# Parse parameters
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help)
+      print_help
+      exit $STATE_OK
+      ;;
+    -v | --version)
+      print_release
+      exit $STATE_OK
+      ;;
+    -H | --host)
+      shift
+      HOST=$1
+      ;;
+    -P | --port)
+      shift
+      PORT=$1
+      ;;
+    --exclude)
+      shift
+      EXCLUDE=$1
+      ;;
+    --include)
+      shift
+      INCLUDE=$1
+      ;;      
+    --https)
+      PROTOCOL=https://
+      ;;
+    --cert)
+      shift
+      CERT=$1
+      ;;
+    --key)
+      shift
+      KEY=$1
+      ;;
+    --cacert)
+      shift
+      CACERT=$1
+      ;;
+    *)
+      echo "Unknown argument: $1"
+      print_usage
+      exit $STATE_UNKNOWN
+      ;;
+  esac
+  shift
+done
+
+if [ -z "$HOST" ]; then
+  echo "UNKNOWN: Host name must be specified"
+  exit $STATE_UNKNOWN
+fi
+
+TLS_OPTIONS=
+
+if [ "$PROTOCOL" == "https://" ]; then
+  # Check all cert info is set
+  if [[ -z "$CERT" || -z "$KEY" || -z "$CACERT" ]]; then
+    echo "UNKNOWN: Missing client certificate, key or ca cert."
+    exit $STATE_UNKNOWN
+  else
+    TLS_OPTIONS="--cert $CERT --key $KEY --cacert $CACERT"
+  fi
+fi
+
+JSON=`${CURL} --silent ${PROTOCOL}${HOST}:${PORT}/containers/json?all=true $TLS_OPTIONS`
+
+CONTAINERS=`echo $JSON | ${JQ} -r '.[].Names[0]'`
+
+if [ -z "$CONTAINERS" ]; then
+  echo "UNKNOWN: Unable to retrieve docker containers from API"
+  exit $STATE_UNKNOWN
+fi
+
+running=0
+notrunning=0
+
+NAGIOS_DATA=
+
+for CONTAINER in $CONTAINERS; do
+
+  # Match the container (minus the leading /) to the exlude list
+  if [[ ! $EXCLUDE == *"${CONTAINER:1}"* ]]; then
+
+    if [[ -z "$INCLUDE" || $INCLUDE == *"${CONTAINER:1}"* ]]; then
+
+      NAME=`echo $JSON | ${JQ} -r '.[] | select(.Names[0]=="'$CONTAINER'") .Names[0]'`
+      STATE=`echo $JSON | ${JQ} -r '.[] | select(.Names[0]=="'$CONTAINER'") .State'`
+      if [ "$STATE" == "running" ]; then
+        ((running++))
+      else
+        ((notrunning++))
+      fi
+      DMY=`echo $JSON | ${JQ} -r '.[] | select(.Names[0]=="'$CONTAINER'") .Created | gmtime | strftime("%Y-%m-%dT%H:%M:%SZ")'`
+      NAGIOS_DATA="${NAGIOS_DATA}name=${NAME:1}, state=$STATE, status=$(((`date +%s` - `date -d $DMY +%s`) / 86400)) days since $DMY, " 
+
+    fi
+  fi
+done
+
+NAGIOS_DATA="${NAGIOS_DATA}running=${running}, notrunning=${notrunning}"
+
+if [ $notrunning -gt 0 ]; then
+  echo "DOCKER CONTAINERS CRITICAL: ${NAGIOS_DATA}"
+  exit $STATE_CRITICAL
+else
+  echo "DOCKER CONTAINERS OK: ${NAGIOS_DATA}"
+  exit $STATE_OK
+fi

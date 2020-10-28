@@ -1,0 +1,198 @@
+#!/bin/bash
+
+# See https://docs.docker.com/engine/api/v1.40/#operation/ContainerStats
+
+JQ=`which jq`
+CURL=`which curl`
+AWK=`which awk`
+
+# Nagios return codes
+STATE_OK=0
+STATE_WARNING=1
+STATE_CRITICAL=2
+STATE_UNKNOWN=3
+
+# Plugin variable description
+PROGNAME=$(basename $0)
+RELEASE="Revision 1.0.0"
+AUTHOR="(c) 2020 Paul Bargewell (paul.bargewell@opusvl.com)"
+
+if [ ! -x $JQ ]; then
+  echo "UNKNOWN: jq not found or is not executable"
+  exit $STATE_UNKNOWN
+fi
+
+if [ ! -x $CURL ]; then
+  echo "UNKNOWN: curl not found or is not executable"
+  exit $STATE_UNKNOWN
+fi
+
+if [ ! -x $AWK ]; then
+  echo "UNKNOWN: awk not found or is not executable"
+  exit $STATE_UNKNOWN
+fi
+
+# Functions plugin usage
+print_release() {
+    echo "$RELEASE $AUTHOR"
+}
+
+print_usage() {
+    echo ""
+    echo "$PROGNAME $RELEASE - Checks Docker Container Status from Docker API for Icinga2"
+    echo ""
+    echo "Usage: $PROGNAME"
+    echo ""
+    echo "  -h               Show this page"
+    echo ""
+    echo "  -H | --host      Host name / IP of Docker API server (required)"
+    echo ""
+    echo "  -P | --port      Port Number of Docker API Service"
+    echo ""
+    echo "  --https      Use HTTPS requires cert, key and cacert set"
+    echo ""
+    echo "    --cert       Client certificate (pem)"
+    echo ""
+    echo "    --key        Client key (pem)"
+    echo ""
+    echo "    --cacert     CA cert (pem)"
+    echo ""
+    echo "  -C | --container Name of container to inspect"
+    echo ""
+    echo "Usage: $PROGNAME --help"
+    echo ""
+    exit 0
+}
+
+print_help() {
+	print_usage
+  echo ""
+  echo "This plugin will check Docker container statuses using the Docker API"
+  echo ""
+	exit 0
+}
+
+# Defaults
+PROTOCOL=http://
+PORT=2376
+EXCLUDE=
+INCLUDE=
+
+# Parse parameters
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h | --help)
+      print_help
+      exit $STATE_OK
+      ;;
+    -v | --version)
+      print_release
+      exit $STATE_OK
+      ;;
+    -H | --host)
+      shift
+      HOST=$1
+      ;;
+    -P | --port)
+      shift
+      PORT=$1
+      ;;
+    -C | --container)
+      shift
+      CONTAINER=$1
+      ;;
+    --exclude)
+      shift
+      EXCLUDE=$1
+      ;;
+    --include)
+      shift
+      INCLUDE=$1
+      ;;      
+    --https)
+      PROTOCOL=https://
+      ;;            
+    --cert)
+      shift
+      CERT=$1
+      ;;
+    --key)
+      shift
+      KEY=$1
+      ;;
+    --cacert)
+      shift
+      CACERT=$1
+      ;;      
+    *)
+      echo "Unknown argument: $1"
+      print_usage
+      exit $STATE_UNKNOWN
+      ;;
+  esac
+  shift
+done
+
+if [ -z "$HOST" ]; then
+  echo "UNKNOWN: Host name must be specified"
+  exit $STATE_UNKNOWN
+fi
+
+TLS_OPTIONS=
+
+if [ "$PROTOCOL" == "https://" ]; then
+  # Check all cert info is set
+  if [[ -z "$CERT" || -z "$KEY" || -z "$CACERT" ]]; then
+    echo "UNKNOWN: Missing client certificate, key or ca cert."
+    exit $STATE_UNKNOWN
+  else
+    TLS_OPTIONS="--cert $CERT --key $KEY --cacert $CACERT"
+  fi
+fi
+
+# Get the ID of the container for the next call to stats
+ID=$(eval "${CURL} --silent ${PROTOCOL}${HOST}:${PORT}/containers/json?all=true $TLS_OPTIONS | ${JQ} -r '.[] | select(.Names[0] == \"/${CONTAINER}\") .Id'")
+
+# Make a one time (not streaming) call to stats
+JSON=`${CURL} --silent ${PROTOCOL}${HOST}:${PORT}/containers/${ID}/stats?stream=false $TLS_OPTIONS`
+
+NAGIOS_DATA=
+
+memory_stats_usage=`echo ${JSON} | ${JQ} .memory_stats.usage`
+memory_stats_stats_cache=`echo ${JSON} | ${JQ} .memory_stats.stats.cache`
+used_memory=($memory_stats_usage - $memory_stats_stats_cache)
+
+available_memory=`echo ${JSON} | ${JQ} .memory_stats.limit`
+
+memory_usage=`echo "${used_memory} ${available_memory}" | ${AWK} '{printf "%.2f", $1 / $2 * 100}'`
+memory_usage_d=`echo "${used_memory} ${available_memory}" | ${AWK} '{printf "%d", $1 / $2 * 100}'`
+
+cpu_stats_cpu_usage_total_usage=`echo ${JSON} | ${JQ} .cpu_stats.cpu_usage.total_usage`
+precpu_stats_cpu_usage_total_usage=`echo ${JSON} | ${JQ} .precpu_stats.cpu_usage.total_usage`
+
+cpu_delta=`echo "${cpu_stats_cpu_usage_total_usage} ${precpu_stats_cpu_usage_total_usage}" | ${AWK} '{printf "%d", $1 - $2}'`
+
+cpu_stats_system_cpu_usage=`echo ${JSON} | ${JQ} .cpu_stats.system_cpu_usage`
+precpu_stats_system_cpu_usage=`echo ${JSON} | ${JQ} .precpu_stats.system_cpu_usage`
+
+system_cpu_delta=`echo "${cpu_stats_system_cpu_usage} ${precpu_stats_system_cpu_usage}" | ${AWK} '{printf "%d", $1 - $2}'`
+
+number_cpus=`echo ${JSON} | ${JQ} .cpu_stats.online_cpus`
+
+cpu_usage=`echo "${cpu_delta} ${system_cpu_delta} ${number_cpus}" | ${AWK} '{printf "%f", ($1 / $2) * 100}'`
+cpu_usage_d=`echo "${cpu_delta} ${system_cpu_delta} ${number_cpus}" | ${AWK} '{printf "%d", ($1 / $2) * 100}'`
+
+NAGIOS_DATA="${NAGIOS_DATA}cpu_usage=${cpu_usage}%, memory_usage=${memory_usage}%, number_cpus=${number_cpus}" 
+
+
+# Use the integer (non-decimal) version for the comparison
+if [ $cpu_usage_d -gt 90 ]; then
+  echo "DOCKER CONTAINER CRITICAL: ${NAGIOS_DATA}"
+  exit $STATE_CRITICAL
+elif [ $cpu_usage_d -gt 50 ]; then
+  echo "DOCKER CONTAINER WARNING: ${NAGIOS_DATA}"
+  exit $STATE_WARNING
+else
+  echo "DOCKER CONTAINER OK: ${NAGIOS_DATA}"
+  exit $STATE_OK
+fi
