@@ -77,7 +77,7 @@ object CheckCommand "check_dockerapi" {
 Like it's parent this connects to the docker API, but this time returns performance metrics from a specific container.
 
 ```shell
-$ ./check_dockerapi_stats -h                                                                                                                                                               [±master ●]
+$ ./check_dockerapi_stats -h
 
 check_dockerapi_stats Revision 1.0.0 - Checks Docker Container Status from Docker API for Icinga2
 
